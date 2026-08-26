@@ -13,6 +13,7 @@ on:
 permissions:
   contents: write
   actions: write
+  pull-requests: write
 
 defaults:
   run:
@@ -45,95 +46,136 @@ jobs:
           $translatedFiles = Get-ChildItem -Path $pwd -Filter "*.xlf" -Recurse -ErrorAction SilentlyContinue |
               Where-Object { $_.FullName -match '[\\/]Translations[\\/]' -and -not $_.Name.EndsWith('.g.xlf') }
 
-          if (-not $translatedFiles) {
+          $hasTranslations = [bool]$translatedFiles
+          # true only when this run had to fall back to a PR instead of a direct push (see
+          # below) - main won't actually contain the translations yet once this step ends,
+          # so "Start CI/CD" must not fire this run; it fires on the later push made by the
+          # PR's merge instead.
+          $usedFallbackPr = $false
+
+          if (-not $hasTranslations) {
               Write-Host "No translated files found"
-              Add-Content $env:GITHUB_OUTPUT "has_translations=false"
-              exit 0
-          }
-
-          Write-Host "Found $($translatedFiles.Count) translated files"
-          Add-Content $env:GITHUB_OUTPUT "has_translations=true"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          $translatedFiles | ForEach-Object { git add $_.FullName }
-
-          $status = git status --porcelain
-          if (-not $status) {
-              Write-Host "No changes to commit - translations already up to date"
-              exit 0
-          }
-
-          # GhTokenWorkflow is either a classic PAT or (as AL-Go supports) a GitHub App
-          # definition: {"GitHubAppClientId":"...","PrivateKey":"..."}. An app definition
-          # cannot be used as a bearer token directly - sign a short-lived JWT with the
-          # private key and exchange it for an installation access token, like AL-Go does.
-          $secret = $env:ghTokenWorkflowSecret
-          if (-not $secret) { throw "Secret GHTOKENWORKFLOW is not configured" }
-
-          $token = if ($secret.TrimStart().StartsWith('{')) {
-              $app = $secret | ConvertFrom-Json
-              $keyType = if ($app.PrivateKey -match 'BEGIN RSA PRIVATE KEY') { 'RSA PRIVATE KEY' } else { 'PRIVATE KEY' }
-              $keyBody = $app.PrivateKey -replace '-----(BEGIN|END)[^-]+-----', '' -replace '\s', ''
-              $pemLines = for ($i = 0; $i -lt $keyBody.Length; $i += 64) { $keyBody.Substring($i, [Math]::Min(64, $keyBody.Length - $i)) }
-              $pem = "-----BEGIN $keyType-----`n$($pemLines -join "`n")`n-----END $keyType-----"
-              $rsa = [System.Security.Cryptography.RSA]::Create()
-              $rsa.ImportFromPem($pem)
-
-              function ConvertTo-Base64Url([byte[]]$bytes) {
-                  [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-              }
-
-              $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-              $jwtHeader = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; typ = 'JWT' } | ConvertTo-Json -Compress)))
-              $jwtPayload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ iat = $now - 60; exp = $now + 540; iss = $app.GitHubAppClientId } | ConvertTo-Json -Compress)))
-              $signature = ConvertTo-Base64Url ($rsa.SignData([Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
-              $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
-              $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
-              $installation = $installations | Where-Object { $_.account.login -eq 'XPR365-BC' } | Select-Object -First 1
-              if (-not $installation) { throw "GitHub App has no installation on XPR365-BC" }
-              (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders).token
           } else {
-              $secret  # Classic PAT
-          }
-          Write-Host "::add-mask::$token"
+              Write-Host "Found $($translatedFiles.Count) translated files"
 
-          git commit -m "Update translations [skip ci]"
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              $translatedFiles | ForEach-Object { git add $_.FullName }
 
-          # Direct commit to the branch that triggered this run - no separate branch, no PR.
-          # The checkout above is pinned to the commit that triggered this run, and the
-          # pipeline (BC compile + up to 45 minutes of translation) can take a long time, so
-          # the branch tip has very likely moved by push time - either from someone else's
-          # commit, or from another run of this same pipeline finishing first. Retry with a
-          # fetch+rebase instead of failing outright on the first non-fast-forward rejection.
-          $authRemote = "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git"
-          $branch = "${{ github.ref_name }}"
-          $maxAttempts = 5
-          $pushed = $false
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-              git push $authRemote "HEAD:$branch"
-              if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+              $status = git status --porcelain
+              if (-not $status) {
+                  Write-Host "No changes to commit - translations already up to date"
+              } else {
+                  # GhTokenWorkflow is either a classic PAT or (as AL-Go supports) a GitHub App
+                  # definition: {"GitHubAppClientId":"...","PrivateKey":"..."}. An app definition
+                  # cannot be used as a bearer token directly - sign a short-lived JWT with the
+                  # private key and exchange it for an installation access token, like AL-Go does.
+                  $secret = $env:ghTokenWorkflowSecret
+                  if (-not $secret) { throw "Secret GHTOKENWORKFLOW is not configured" }
 
-              if ($attempt -eq $maxAttempts) { break }
+                  $token = if ($secret.TrimStart().StartsWith('{')) {
+                      $app = $secret | ConvertFrom-Json
+                      $keyType = if ($app.PrivateKey -match 'BEGIN RSA PRIVATE KEY') { 'RSA PRIVATE KEY' } else { 'PRIVATE KEY' }
+                      $keyBody = $app.PrivateKey -replace '-----(BEGIN|END)[^-]+-----', '' -replace '\s', ''
+                      $pemLines = for ($i = 0; $i -lt $keyBody.Length; $i += 64) { $keyBody.Substring($i, [Math]::Min(64, $keyBody.Length - $i)) }
+                      $pem = "-----BEGIN $keyType-----`n$($pemLines -join "`n")`n-----END $keyType-----"
+                      $rsa = [System.Security.Cryptography.RSA]::Create()
+                      $rsa.ImportFromPem($pem)
 
-              Write-Host "Push rejected (attempt $attempt/$maxAttempts) - $branch moved, rebasing onto its current tip..."
-              git fetch $authRemote $branch
-              if ($LASTEXITCODE -ne 0) { throw "git fetch failed while retrying the push to $branch" }
-              git rebase FETCH_HEAD
-              if ($LASTEXITCODE -ne 0) {
-                  git rebase --abort
-                  throw "Could not rebase the translation commit onto the current tip of $branch - it conflicts with a newer commit and needs manual resolution."
+                      function ConvertTo-Base64Url([byte[]]$bytes) {
+                          [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+                      }
+
+                      $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                      $jwtHeader = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; typ = 'JWT' } | ConvertTo-Json -Compress)))
+                      $jwtPayload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ iat = $now - 60; exp = $now + 540; iss = $app.GitHubAppClientId } | ConvertTo-Json -Compress)))
+                      $signature = ConvertTo-Base64Url ($rsa.SignData([Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
+                      $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
+                      $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
+                      $installation = $installations | Where-Object { $_.account.login -eq 'XPR365-BC' } | Select-Object -First 1
+                      if (-not $installation) { throw "GitHub App has no installation on XPR365-BC" }
+                      (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders).token
+                  } else {
+                      $secret  # Classic PAT
+                  }
+                  Write-Host "::add-mask::$token"
+
+                  git commit -m "Update translations [skip ci]"
+
+                  # Prefer a direct commit to the branch that triggered this run - no
+                  # separate branch, no PR. The checkout above is pinned to the commit that
+                  # triggered this run, and the pipeline (BC compile + up to 45 minutes of
+                  # translation) can take a long time, so the branch tip has very likely
+                  # moved by push time - either from someone else's commit, or from another
+                  # run of this same pipeline finishing first. Retry with a fetch+rebase
+                  # instead of failing outright on the first non-fast-forward rejection.
+                  #
+                  # If the branch has a "require pull request" protection rule, direct
+                  # pushes are rejected outright (GH006) no matter how many times we retry -
+                  # fall back to pushing a scratch branch and opening/auto-merging a PR.
+                  $authRemote = "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git"
+                  $branch = "${{ github.ref_name }}"
+                  $maxAttempts = 5
+                  $pushed = $false
+                  $protectedBranch = $false
+
+                  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                      $pushOutput = git push $authRemote "HEAD:$branch" 2>&1 | Out-String
+                      Write-Host $pushOutput
+                      if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+
+                      if ($pushOutput -match 'protected branch|GH006') {
+                          Write-Host "$branch rejects direct pushes (protected branch) - falling back to a pull request."
+                          $protectedBranch = $true
+                          break
+                      }
+
+                      if ($attempt -eq $maxAttempts) { break }
+
+                      Write-Host "Push rejected (attempt $attempt/$maxAttempts) - $branch moved, rebasing onto its current tip..."
+                      git fetch $authRemote $branch
+                      if ($LASTEXITCODE -ne 0) { throw "git fetch failed while retrying the push to $branch" }
+                      git rebase FETCH_HEAD
+                      if ($LASTEXITCODE -ne 0) {
+                          git rebase --abort
+                          throw "Could not rebase the translation commit onto the current tip of $branch - it conflicts with a newer commit and needs manual resolution."
+                      }
+                  }
+
+                  if ($pushed) {
+                      Write-Host "Pushed translation updates to $branch"
+                  } elseif ($protectedBranch) {
+                      $prBranch = "translate-app-${{ github.run_number }}"
+                      git push $authRemote "HEAD:refs/heads/$prBranch"
+                      if ($LASTEXITCODE -ne 0) { throw "Failed to push translation commit to fallback branch $prBranch" }
+                      Write-Host "Pushed translation updates to $prBranch"
+
+                      $env:GH_TOKEN = $token
+                      gh pr create --repo $env:GITHUB_REPOSITORY --base $branch --head $prBranch `
+                          --title "Update translations [skip ci]" --body "Automated translation update."
+                      if ($LASTEXITCODE -ne 0) { throw "Failed to create a pull request for $prBranch -> $branch" }
+
+                      gh pr merge $prBranch --repo $env:GITHUB_REPOSITORY --squash --auto
+                      if ($LASTEXITCODE -ne 0) {
+                          Write-Host "Could not enable auto-merge on the translation PR - it may need a manual review/approval or repo auto-merge isn't enabled."
+                      }
+                      $usedFallbackPr = $true
+                  } else {
+                      throw "Failed to push translation updates to $branch after $maxAttempts attempts"
+                  }
               }
           }
 
-          if (-not $pushed) { throw "Failed to push translation updates to $branch after $maxAttempts attempts" }
-          Write-Host "Pushed translation updates to $branch"
+          Add-Content $env:GITHUB_OUTPUT "has_translations=$($hasTranslations.ToString().ToLower())"
+          Add-Content $env:GITHUB_OUTPUT "used_fallback_pr=$($usedFallbackPr.ToString().ToLower())"
 
       - name: Start CI/CD
-        # Always for a push to main; for a manual run, only when requested.
+        # Always for a push to main; for a manual run, only when requested. Never when this
+        # run fell back to a PR - main doesn't have the translations yet, so dispatching now
+        # would build a stale tree; the PR's eventual merge triggers its own push-to-main run
+        # that dispatches CI/CD correctly once the translations have actually landed.
         # A push to any other branch never reaches this step.
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
+        if: steps.commit.outputs.used_fallback_pr != 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -149,9 +191,11 @@ jobs:
           Write-Host "CI/CD dispatched on $($env:GITHUB_REF_NAME)."
 
       - name: Skip CI/CD
-        if: "!((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))"
+        if: "!(steps.commit.outputs.used_fallback_pr != 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)))"
         run: |
-          if ('${{ github.event_name }}' -eq 'push') {
+          if ('${{ steps.commit.outputs.used_fallback_pr }}' -eq 'true') {
+              Write-Host "Translations went through a fallback PR - not starting CI/CD now. It will start once the PR merges and re-triggers this pipeline on main."
+          } elseif ('${{ github.event_name }}' -eq 'push') {
               Write-Host "Push to $($env:GITHUB_REF_NAME) - CI/CD only auto-starts for main. Not starting it."
           } else {
               Write-Host "Manual run without 'Start the CI/CD workflow after translating' checked. Not starting CI/CD."
