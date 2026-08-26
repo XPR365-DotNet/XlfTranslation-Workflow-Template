@@ -150,3 +150,11 @@ jobs:
           } else {
               throw "Failed to push workflow sync to $branch after $maxAttempts attempts"
           }
+
+          # A tolerated native-command failure above (e.g. gh pr merge --auto not being
+          # enabled for this repo) leaves $LASTEXITCODE non-zero even though we only logged
+          # a warning for it. GitHub Actions' pwsh wrapper re-exits with that stale code at
+          # the end of the script, which would fail this step despite our own logic treating
+          # it as success - every real failure path above already throws, so reaching this
+          # line always means success regardless of what $LASTEXITCODE currently holds.
+          exit 0

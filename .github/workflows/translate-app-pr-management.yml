@@ -169,6 +169,14 @@ jobs:
           Add-Content $env:GITHUB_OUTPUT "has_translations=$($hasTranslations.ToString().ToLower())"
           Add-Content $env:GITHUB_OUTPUT "used_fallback_pr=$($usedFallbackPr.ToString().ToLower())"
 
+          # A tolerated native-command failure above (e.g. gh pr merge --auto not being
+          # enabled for this repo) leaves $LASTEXITCODE non-zero even though we only logged
+          # a warning for it. GitHub Actions' pwsh wrapper re-exits with that stale code at
+          # the end of the script, which would fail this step despite our own logic treating
+          # it as success - every real failure path above already throws, so reaching this
+          # line always means success regardless of what $LASTEXITCODE currently holds.
+          exit 0
+
       - name: Start CI/CD
         # Always for a push to main; for a manual run, only when requested. Never when this
         # run fell back to a PR - main doesn't have the translations yet, so dispatching now
