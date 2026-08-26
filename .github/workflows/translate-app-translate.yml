@@ -6,6 +6,16 @@ on:
       translationServiceUrl:
         type: string
         default: https://xlftranslation-func-8370.azurewebsites.net
+      # A first (cold, no translation-memory) run can legitimately take hours for a large
+      # app - these bound the wait without killing a job that's still making progress.
+      translationStallTimeoutMinutes:
+        description: 'Give up if a translation job reports no progress for this many minutes'
+        type: number
+        default: 15
+      translationMaxTimeoutMinutes:
+        description: 'Absolute ceiling on how long to wait for a translation job, even if still progressing'
+        type: number
+        default: 480
     secrets:
       XLF_TRANSLATION_FUNCTION_KEY:
         required: true
@@ -17,6 +27,12 @@ defaults:
 jobs:
   Translate:
     runs-on: self-hosted
+    # Otherwise GitHub Actions' own default job timeout (360 minutes) would kill the job
+    # before the script's own translationMaxTimeoutMinutes ceiling ever gets a chance to
+    # fire its clearer error. (GitHub Actions expressions don't support arithmetic, so this
+    # can't add a small buffer on top - the script polls every 2 seconds, so in practice its
+    # own throw still fires first.)
+    timeout-minutes: ${{ inputs.translationMaxTimeoutMinutes }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,6 +49,8 @@ jobs:
         env:
           functionKey: ${{ secrets.XLF_TRANSLATION_FUNCTION_KEY }}
           translationServiceUrl: ${{ inputs.translationServiceUrl }}
+          translationStallTimeoutMinutes: ${{ inputs.translationStallTimeoutMinutes }}
+          translationMaxTimeoutMinutes: ${{ inputs.translationMaxTimeoutMinutes }}
         run: |
           if (-not $env:functionKey) { throw "Secret XLF_TRANSLATION_FUNCTION_KEY is not configured" }
 
@@ -78,16 +96,37 @@ jobs:
               $jobId = $submit.jobId
               Write-Host "Translation job queued: $jobId"
 
-              # A first run translates every language and can take a while; later runs are
-              # served from the service's translation memory and finish in seconds.
-              $deadline = (Get-Date).AddMinutes(45)
+              # A first run translates every language and can take a while (large apps have
+              # been observed needing several hours); later runs are served from the
+              # service's translation memory and finish in seconds. So instead of a fixed
+              # wall-clock deadline that would kill a job that's still steadily working,
+              # bail out only if it stops making forward progress - backstopped by a
+              # generous absolute ceiling in case it never reports "completed"/"failed" at all.
+              $stallTimeout = New-TimeSpan -Minutes ([int]$env:translationStallTimeoutMinutes)
+              $absoluteCeiling = (Get-Date).AddMinutes([int]$env:translationMaxTimeoutMinutes)
+              $lastProgress = $null
+              $lastProgressAt = Get-Date
+
               do {
                   Start-Sleep -Seconds 2
                   # ${jobId} - braces required: in pwsh '?' is legal in variable names, so
                   # "$jobId?code=" would resolve the undefined variable 'jobId?code' instead.
                   $status = Invoke-RestMethod "$($env:translationServiceUrl)/api/status/${jobId}?code=$($env:functionKey)"
                   Write-Host "[$(Get-Date -Format HH:mm:ss)] $($status.Progress)% - $($status.Status) - $($status.Message)"
-              } while ($status.Status -notin 'completed', 'failed' -and (Get-Date) -lt $deadline)
+
+                  if ($status.Status -in 'completed', 'failed') { break }
+
+                  if ($status.Progress -ne $lastProgress) {
+                      $lastProgress = $status.Progress
+                      $lastProgressAt = Get-Date
+                  } elseif (((Get-Date) - $lastProgressAt) -gt $stallTimeout) {
+                      throw "Translation job $jobId for '$($app.Name)' appears stalled - no progress for $($stallTimeout.TotalMinutes) minutes (stuck at $lastProgress%)."
+                  }
+
+                  if ((Get-Date) -gt $absoluteCeiling) {
+                      throw "Translation job $jobId for '$($app.Name)' did not finish within the $([int]$env:translationMaxTimeoutMinutes)-minute ceiling, even though it was still progressing (at $($status.Progress)%). Raise translationMaxTimeoutMinutes if this app's first-time translation genuinely needs longer."
+                  }
+              } while ($true)
 
               if ($status.Status -ne 'completed') {
                   throw "Translation job $jobId for '$($app.Name)' did not complete: $($status.Status) - $($status.Error)"
