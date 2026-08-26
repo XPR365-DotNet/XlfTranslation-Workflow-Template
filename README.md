@@ -57,6 +57,12 @@ Required secrets in the calling repository: `GHTOKENWORKFLOW` (PAT or GitHub App
 used to download cross-org dependency apps and to push the translation commit) and
 `XLF_TRANSLATION_FUNCTION_KEY` (the translation service's host/master key).
 
+If the target branch is protected, PR Management falls back to a scratch branch named
+`translate-app-<run number>` plus a PR, and deletes that branch itself once the PR has
+actually merged (it polls briefly right after requesting the merge; if the merge is still
+pending after that - e.g. waiting on required reviews - the branch is left for manual cleanup
+rather than risk deleting it before the merge it depends on completes).
+
 ## Keeping the orchestrator in sync
 
 The four `uses: ...@main` jobs above always resolve to this repo's latest `main`, so they

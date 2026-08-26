@@ -159,6 +159,33 @@ jobs:
                       if ($LASTEXITCODE -ne 0) {
                           Write-Host "Could not enable auto-merge on the translation PR - it may need a manual review/approval or repo auto-merge isn't enabled."
                       }
+
+                      # Only ever delete $prBranch once the PR has actually merged. `--auto`
+                      # above may just have ENABLED a deferred merge (still waiting on
+                      # required checks/reviews) - gh CLI's own --delete-branch flag deletes
+                      # unconditionally right after enabling it, before the real merge has
+                      # happened, which would pull the branch out from under a merge that
+                      # still depends on it. Poll briefly for the common case (nothing
+                      # blocking, so it merges within seconds); if it's still pending after
+                      # that, leave the branch behind rather than risk deleting it too early.
+                      $mergedNow = $false
+                      for ($i = 0; $i -lt 24; $i++) {
+                          Start-Sleep -Seconds 5
+                          $prState = gh pr view $prBranch --repo $env:GITHUB_REPOSITORY --json state 2>$null | ConvertFrom-Json
+                          if ($prState -and $prState.state -eq 'MERGED') { $mergedNow = $true; break }
+                      }
+
+                      if ($mergedNow) {
+                          gh api -X DELETE "repos/$($env:GITHUB_REPOSITORY)/git/refs/heads/$prBranch" 2>&1 | Out-Null
+                          if ($LASTEXITCODE -eq 0) {
+                              Write-Host "Deleted merged branch $prBranch"
+                          } else {
+                              Write-Host "Could not delete branch $prBranch after merge (it may already be gone)"
+                          }
+                      } else {
+                          Write-Host "$prBranch is not merged yet - leaving it in place; delete it manually once the PR merges."
+                      }
+
                       $usedFallbackPr = $true
                   } else {
                       throw "Failed to push translation updates to $branch after $maxAttempts attempts"
