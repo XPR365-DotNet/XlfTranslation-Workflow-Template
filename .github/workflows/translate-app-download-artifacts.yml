@@ -1,32 +1,17 @@
 name: Translate App - Download Artifacts
-
 on:
   workflow_call:
     secrets:
       GHTOKENWORKFLOW:
-        required: true
-
+        required: false
 defaults:
   run:
     shell: pwsh
-
 jobs:
   Download:
     runs-on: self-hosted
     steps:
-      - name: Checkout caller repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GHTOKENWORKFLOW }}
-
-      - name: Discover apps and download BC artifacts
-        run: Write-Host "Phase 1: Download artifacts and discover apps"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: BuildArtifacts
-          path: |
-            .alpackages/
-            .apps-order.json
-          retention-days: 1
+      - run: Write-Host "Download artifacts"

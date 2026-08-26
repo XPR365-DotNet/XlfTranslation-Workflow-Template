@@ -1,37 +1,17 @@
 name: Translate App - Compile
-
 on:
   workflow_call:
     secrets:
       GHTOKENWORKFLOW:
         required: false
-
 defaults:
   run:
     shell: pwsh
-
 jobs:
   Compile:
     runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GHTOKENWORKFLOW }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: BuildArtifacts
-
-      - name: Compile apps
-        run: Write-Host "Phase 2: Compile apps"
-
-      - name: Upload compiled artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: CompiledApps
-          path: |
-            .output/
-            .alpackages/
-          retention-days: 1
+      - run: Write-Host "Compile apps"

@@ -1,43 +1,21 @@
 name: Translate App - Translate
-
 on:
   workflow_call:
     inputs:
       translationServiceUrl:
         type: string
-        default: 'https://xlftranslation-func-8370.azurewebsites.net'
+        default: https://xlftranslation-func-8370.azurewebsites.net
     secrets:
       GHTOKENWORKFLOW:
         required: false
-      XLF_TRANSLATION_FUNCTION_KEY:
-        required: true
-
 defaults:
   run:
     shell: pwsh
-
 jobs:
   Translate:
     runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GHTOKENWORKFLOW }}
-
-      - name: Download compiled artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: CompiledApps
-
-      - name: Translate via service
-        env:
-          functionKey: ${{ secrets.XLF_TRANSLATION_FUNCTION_KEY }}
-        run: Write-Host "Phase 3: Translate via service"
-
-      - name: Upload translated files
-        uses: actions/upload-artifact@v4
-        with:
-          name: TranslationFiles
-          path: '**/Translations/*.xlf'
-          retention-days: 1
+      - run: Write-Host "Translate via service"

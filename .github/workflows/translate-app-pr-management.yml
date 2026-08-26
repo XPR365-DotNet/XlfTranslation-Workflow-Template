@@ -1,5 +1,4 @@
 name: Translate App - PR Management
-
 on:
   workflow_call:
     inputs:
@@ -8,37 +7,17 @@ on:
         default: false
     secrets:
       GHTOKENWORKFLOW:
-        required: true
-
+        required: false
 defaults:
   run:
     shell: pwsh
-
 jobs:
   PRManagement:
     runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GHTOKENWORKFLOW }}
-
-      - name: Download translation artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: TranslationFiles
-
-      - name: PR Management
-        env:
-          GH_TOKEN: ${{ secrets.GHTOKENWORKFLOW }}
-        run: Write-Host "Phase 4: PR management and CI/CD dispatch"
-
-      - name: Start CI/CD
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: Write-Host "Starting CI/CD workflow"
-
-      - name: Skip CI/CD
-        if: "!((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))"
-        run: Write-Host "CI/CD not triggered"
+      - run: Write-Host "PR management"
+      - if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
+        run: Write-Host "Dispatch CI/CD"
