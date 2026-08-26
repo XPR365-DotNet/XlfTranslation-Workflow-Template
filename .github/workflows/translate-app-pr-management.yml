@@ -1,0 +1,17 @@
+name: Translate App - PR Management
+on:
+  workflow_call:
+    inputs:
+      startCicd:
+        type: boolean
+    secrets:
+      GHTOKENWORKFLOW:
+        required: true
+jobs:
+  PRManagement:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: PR Management step
+        shell: pwsh
+        run: Write-Host 'PR management phase'

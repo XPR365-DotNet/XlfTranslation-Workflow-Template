@@ -1,0 +1,11 @@
+name: Translate App - Compile
+on:
+  workflow_call:
+jobs:
+  Compile:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile step
+        shell: pwsh
+        run: Write-Host 'Compile phase'

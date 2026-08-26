@@ -1,0 +1,14 @@
+name: Translate App - Download Artifacts
+on:
+  workflow_call:
+    secrets:
+      GHTOKENWORKFLOW:
+        required: true
+jobs:
+  Download:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download step
+        shell: pwsh
+        run: Write-Host 'Download phase'

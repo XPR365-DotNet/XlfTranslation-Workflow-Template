@@ -1,0 +1,17 @@
+name: Translate App - Translate
+on:
+  workflow_call:
+    inputs:
+      translationServiceUrl:
+        type: string
+    secrets:
+      XLF_TRANSLATION_FUNCTION_KEY:
+        required: true
+jobs:
+  Translate:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Translate step
+        shell: pwsh
+        run: Write-Host 'Translate phase'
