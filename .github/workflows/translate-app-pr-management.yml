@@ -102,8 +102,33 @@ jobs:
           git commit -m "Update translations [skip ci]"
 
           # Direct commit to the branch that triggered this run - no separate branch, no PR.
-          git push "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git" "HEAD:${{ github.ref_name }}"
-          Write-Host "Pushed translation updates to ${{ github.ref_name }}"
+          # The checkout above is pinned to the commit that triggered this run, and the
+          # pipeline (BC compile + up to 45 minutes of translation) can take a long time, so
+          # the branch tip has very likely moved by push time - either from someone else's
+          # commit, or from another run of this same pipeline finishing first. Retry with a
+          # fetch+rebase instead of failing outright on the first non-fast-forward rejection.
+          $authRemote = "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git"
+          $branch = "${{ github.ref_name }}"
+          $maxAttempts = 5
+          $pushed = $false
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              git push $authRemote "HEAD:$branch"
+              if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+
+              if ($attempt -eq $maxAttempts) { break }
+
+              Write-Host "Push rejected (attempt $attempt/$maxAttempts) - $branch moved, rebasing onto its current tip..."
+              git fetch $authRemote $branch
+              if ($LASTEXITCODE -ne 0) { throw "git fetch failed while retrying the push to $branch" }
+              git rebase FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) {
+                  git rebase --abort
+                  throw "Could not rebase the translation commit onto the current tip of $branch - it conflicts with a newer commit and needs manual resolution."
+              }
+          }
+
+          if (-not $pushed) { throw "Failed to push translation updates to $branch after $maxAttempts attempts" }
+          Write-Host "Pushed translation updates to $branch"
 
       - name: Start CI/CD
         # Always for a push to main; for a manual run, only when requested.
