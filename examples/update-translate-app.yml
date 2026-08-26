@@ -1,0 +1,152 @@
+name: 'Update Translate App Workflow'
+
+# Keeps this repo's copy of the "Translate App" orchestrator in sync with the template
+# repo's example. The four translate-app-*.yml jobs it calls via `uses: ...@main` already
+# auto-update on every run, but the orchestrator file itself (triggers, permissions, job
+# wiring) is a plain copy living in this repo - it does NOT auto-update on its own. This
+# workflow re-syncs it once a day and opens a PR whenever the template has changed.
+#
+# Adjust $targetPath in the "Sync from template repo" step below if your local orchestrator
+# file has a different name/path than XPR365-DotNet/XlfTranslation-Workflow-Template's
+# examples/translate-app.yml.
+on:
+  schedule:
+    - cron: '0 22 * * *' # 22:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  UpdateTranslateAppWorkflow:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Push authenticates explicitly below via an installation/PAT token, so
+          # persisted checkout credentials aren't needed here.
+          persist-credentials: false
+
+      - name: Sync from template repo
+        env:
+          ghTokenWorkflowSecret: ${{ secrets.GHTOKENWORKFLOW }}
+        run: |
+          # Path to this repo's local copy of the orchestrator - adjust to match your repo.
+          $targetPath = '.github/workflows/translate-app.yml'
+          $templateRepo = 'XPR365-DotNet/XlfTranslation-Workflow-Template'
+          $templatePath = 'examples/translate-app.yml'
+          $templateRef = 'main'
+
+          # GhTokenWorkflow is either a classic PAT or (as AL-Go supports) a GitHub App
+          # definition: {"GitHubAppClientId":"...","PrivateKey":"..."}. An app definition
+          # cannot be used as a bearer token directly - sign a short-lived JWT with the
+          # private key and exchange it for an installation access token, like AL-Go does.
+          $secret = $env:ghTokenWorkflowSecret
+          if (-not $secret) { throw "Secret GHTOKENWORKFLOW is not configured" }
+
+          $token = if ($secret.TrimStart().StartsWith('{')) {
+              $app = $secret | ConvertFrom-Json
+              $keyType = if ($app.PrivateKey -match 'BEGIN RSA PRIVATE KEY') { 'RSA PRIVATE KEY' } else { 'PRIVATE KEY' }
+              $keyBody = $app.PrivateKey -replace '-----(BEGIN|END)[^-]+-----', '' -replace '\s', ''
+              $pemLines = for ($i = 0; $i -lt $keyBody.Length; $i += 64) { $keyBody.Substring($i, [Math]::Min(64, $keyBody.Length - $i)) }
+              $pem = "-----BEGIN $keyType-----`n$($pemLines -join "`n")`n-----END $keyType-----"
+              $rsa = [System.Security.Cryptography.RSA]::Create()
+              $rsa.ImportFromPem($pem)
+
+              function ConvertTo-Base64Url([byte[]]$bytes) {
+                  [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+              }
+
+              $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              $jwtHeader = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; typ = 'JWT' } | ConvertTo-Json -Compress)))
+              $jwtPayload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ iat = $now - 60; exp = $now + 540; iss = $app.GitHubAppClientId } | ConvertTo-Json -Compress)))
+              $signature = ConvertTo-Base64Url ($rsa.SignData([Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
+              $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
+              $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
+              $installation = $installations | Where-Object { $_.account.login -eq 'XPR365-BC' } | Select-Object -First 1
+              if (-not $installation) { throw "GitHub App has no installation on XPR365-BC" }
+              (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders).token
+          } else {
+              $secret  # Classic PAT
+          }
+          Write-Host "::add-mask::$token"
+
+          $apiHeaders = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json' }
+          $fileResponse = Invoke-RestMethod "https://api.github.com/repos/$templateRepo/contents/${templatePath}?ref=$templateRef" -Headers $apiHeaders
+          $templateContent = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fileResponse.content))
+          $templateContentSha = $fileResponse.sha.Substring(0, 7)
+
+          $targetDir = Split-Path $targetPath -Parent
+          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+          Set-Content -Path $targetPath -Value $templateContent -NoNewline
+
+          git add $targetPath
+          $status = git status --porcelain
+          if (-not $status) {
+              Write-Host "$targetPath already matches $templateRepo/$templatePath ($templateContentSha) - nothing to do"
+              exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync Translate App workflow from template ($templateContentSha)"
+
+          # Same protected-branch-aware push, with a PR fallback if direct pushes are
+          # rejected (GH006) - see translate-app-pr-management.yml in the template repo for
+          # the fuller explanation of why this retries/falls back.
+          $authRemote = "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git"
+          $branch = "${{ github.ref_name }}"
+          $maxAttempts = 5
+          $pushed = $false
+          $protectedBranch = $false
+
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              $pushOutput = git push $authRemote "HEAD:$branch" 2>&1 | Out-String
+              Write-Host $pushOutput
+              if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
+
+              if ($pushOutput -match 'protected branch|GH006') {
+                  Write-Host "$branch rejects direct pushes (protected branch) - falling back to a pull request."
+                  $protectedBranch = $true
+                  break
+              }
+
+              if ($attempt -eq $maxAttempts) { break }
+
+              Write-Host "Push rejected (attempt $attempt/$maxAttempts) - $branch moved, rebasing onto its current tip..."
+              git fetch $authRemote $branch
+              if ($LASTEXITCODE -ne 0) { throw "git fetch failed while retrying the push to $branch" }
+              git rebase FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) {
+                  git rebase --abort
+                  throw "Could not rebase the sync commit onto the current tip of $branch - it conflicts with a newer commit and needs manual resolution."
+              }
+          }
+
+          if ($pushed) {
+              Write-Host "Pushed workflow sync to $branch"
+          } elseif ($protectedBranch) {
+              $prBranch = "sync-translate-app-workflow-${{ github.run_number }}"
+              git push $authRemote "HEAD:refs/heads/$prBranch"
+              if ($LASTEXITCODE -ne 0) { throw "Failed to push sync commit to fallback branch $prBranch" }
+              Write-Host "Pushed workflow sync to $prBranch"
+
+              $env:GH_TOKEN = $token
+              gh pr create --repo $env:GITHUB_REPOSITORY --base $branch --head $prBranch `
+                  --title "Sync Translate App workflow from template ($templateContentSha)" `
+                  --body "Automated sync of ``$targetPath`` from ``$templateRepo/$templatePath`` ($templateContentSha)."
+              if ($LASTEXITCODE -ne 0) { throw "Failed to create a pull request for $prBranch -> $branch" }
+
+              gh pr merge $prBranch --repo $env:GITHUB_REPOSITORY --squash --auto
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Could not enable auto-merge on the sync PR - it may need a manual review/approval or repo auto-merge isn't enabled."
+              }
+          } else {
+              throw "Failed to push workflow sync to $branch after $maxAttempts attempts"
+          }

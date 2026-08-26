@@ -7,7 +7,7 @@ This repository contains reusable GitHub Actions workflows for the Translate App
 - **translate-app-download-artifacts.yml**: Discovers apps to translate and downloads BC artifacts, the AL compiler, and dependency symbols
 - **translate-app-compile.yml**: Compiles AL apps and generates `.g.xlf` translation files
 - **translate-app-translate.yml**: Translates XLF files via the translation service
-- **translate-app-pr-management.yml**: Commits translations directly to the triggering branch and manages CI/CD dispatch
+- **translate-app-pr-management.yml**: Commits translations directly to the triggering branch (falling back to a PR if the branch is protected) and manages CI/CD dispatch
 
 These four workflows are meant to run as sequential jobs (`needs:`) in a single pipeline, in
 the order listed above. The self-hosted runners are a pool, not one dedicated machine, so
@@ -56,6 +56,16 @@ jobs:
 Required secrets in the calling repository: `GHTOKENWORKFLOW` (PAT or GitHub App definition,
 used to download cross-org dependency apps and to push the translation commit) and
 `XLF_TRANSLATION_FUNCTION_KEY` (the translation service's host/master key).
+
+## Keeping the orchestrator in sync
+
+The four `uses: ...@main` jobs above always resolve to this repo's latest `main`, so they
+auto-update on every run. The orchestrator file itself (`examples/translate-app.yml`) is
+different: it's a plain copy that lives in each consumer repo, so triggers/permissions/job
+wiring changes made here don't reach it automatically. [`examples/update-translate-app.yml`](examples/update-translate-app.yml)
+is a companion scheduled workflow (daily at 22:00 UTC) you can also copy into your repo - it
+diffs your local orchestrator against this repo's `examples/translate-app.yml` and opens a PR
+(or commits directly, if the branch isn't protected) whenever they've drifted.
 
 ## Reference Strategy
 
