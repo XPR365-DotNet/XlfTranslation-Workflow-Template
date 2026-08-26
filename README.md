@@ -4,21 +4,58 @@ This repository contains reusable GitHub Actions workflows for the Translate App
 
 ## Workflows
 
-- **translate-app-download-artifacts.yml**: Downloads BC artifacts and discovers apps to translate
-- **translate-app-compile.yml**: Compiles AL apps and generates translation files
-- **translate-app-translate.yml**: Translates XLF files via translation service
-- **translate-app-pr-management.yml**: Creates PRs with translations and manages CI/CD dispatch
+- **translate-app-download-artifacts.yml**: Discovers apps to translate and downloads BC artifacts, the AL compiler, and dependency symbols
+- **translate-app-compile.yml**: Compiles AL apps and generates `.g.xlf` translation files
+- **translate-app-translate.yml**: Translates XLF files via the translation service
+- **translate-app-pr-management.yml**: Commits translations directly to the triggering branch and manages CI/CD dispatch
+
+These four workflows are meant to run as sequential jobs (`needs:`) in a single pipeline, in
+the order listed above. The self-hosted runners are a pool, not one dedicated machine, so
+nothing on the local filesystem is assumed to survive between jobs - each job hands its output
+to the next via `actions/upload-artifact` / `actions/download-artifact`:
+
+| Artifact | Produced by | Consumed by | Contents |
+| --- | --- | --- | --- |
+| `translate-build-inputs` | Download Artifacts | Compile | `.apps-order.json`, `.alpackages/**` (symbols), `.altools/**` (AL compiler) |
+| `translate-generated-xlf` | Compile | Translate | `.apps-order.json`, `**/Translations/*.g.xlf` |
+| `TranslationFiles` | Translate | PR Management | `**/Translations/*.xlf` |
+
+`.apps-order.json` records each app's folder as a path **relative to the repo root** (not an
+absolute path), since it is read back by jobs running on a different runner with a different
+checkout path. Don't hand-edit it.
 
 ## Usage
 
-Use these workflows in your repository by referencing them in your Translate App workflow:
+Add a workflow to your repository that calls these four jobs in sequence - see
+[`examples/translate-app.yml`](examples/translate-app.yml) for a full, ready-to-use example
+(triggers, permissions, and job wiring included). The core pattern:
 
 ```yaml
 jobs:
   DownloadArtifacts:
     uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-download-artifacts.yml@main
     secrets: inherit
+
+  Compile:
+    needs: DownloadArtifacts
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-compile.yml@main
+
+  Translate:
+    needs: Compile
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-translate.yml@main
+    secrets: inherit
+
+  PRManagement:
+    needs: Translate
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-pr-management.yml@main
+    with:
+      startCicd: ${{ github.event_name == 'workflow_dispatch' && inputs.startCicd || false }}
+    secrets: inherit
 ```
+
+Required secrets in the calling repository: `GHTOKENWORKFLOW` (PAT or GitHub App definition,
+used to download cross-org dependency apps and to push the translation commit) and
+`XLF_TRANSLATION_FUNCTION_KEY` (the translation service's host/master key).
 
 ## Reference Strategy
 

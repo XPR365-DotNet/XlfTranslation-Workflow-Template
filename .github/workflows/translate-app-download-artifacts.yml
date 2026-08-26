@@ -1,17 +1,433 @@
 name: Translate App - Download Artifacts
+
 on:
   workflow_call:
+    inputs:
+      bcArtifactStorage:
+        type: string
+        default: https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net
+      bcArtifactCache:
+        type: string
+        default: C:\bcartifacts.cache
     secrets:
       GHTOKENWORKFLOW:
-        required: false
+        required: true
+
 defaults:
   run:
     shell: pwsh
+
 jobs:
   Download:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          token: ${{ secrets.GHTOKENWORKFLOW }}
-      - run: Write-Host "Download artifacts"
+          persist-credentials: false
+
+      - name: Discover apps to translate
+        run: |
+          # Every folder with an app.json is an app; only apps whose 'features' array
+          # contains 'TranslationFile' generate a .g.xlf at compile time and get translated.
+          # Local dependencies of those apps are compiled too (for symbols), in dependency order.
+          $appJsonFiles = Get-ChildItem -Path $pwd -Filter app.json -Recurse -Depth 2 |
+              Where-Object { $_.FullName -notmatch '[\\/]\.' }
+
+          $apps = foreach ($file in $appJsonFiles) {
+              $json = Get-Content $file.FullName -Raw | ConvertFrom-Json
+              # Folder is stored relative to the repo root: this file travels via
+              # actions/upload-artifact to other jobs that run on a different runner with a
+              # different absolute checkout path, so an absolute path would not resolve there.
+              $relativeFolder = $file.Directory.FullName.Substring($pwd.Path.Length + 1)
+              [pscustomobject]@{
+                  Folder             = $relativeFolder
+                  Name               = $json.name
+                  Publisher          = $json.publisher
+                  Version            = $json.version
+                  ApplicationVersion = $json.application
+                  Id                 = $json.id
+                  Dependencies       = @($json.dependencies | ForEach-Object { $_.id })
+                  Translate          = @($json.features) -contains 'TranslationFile'
+              }
+          }
+
+          if (-not ($apps | Where-Object Translate)) {
+              throw "No app.json in this repository has the 'TranslationFile' feature - nothing to translate."
+          }
+
+          # Restrict to translatable apps plus their transitive in-repo dependencies
+          $byId = @{}
+          $apps | ForEach-Object { $byId[$_.Id] = $_ }
+          $needed = [System.Collections.Generic.HashSet[string]]::new()
+          function Add-WithDependencies($app) {
+              if ($needed.Add($app.Id)) {
+                  foreach ($depId in $app.Dependencies) {
+                      if ($byId.ContainsKey($depId)) { Add-WithDependencies $byId[$depId] }
+                  }
+              }
+          }
+          $apps | Where-Object Translate | ForEach-Object { Add-WithDependencies $_ }
+          $neededApps = @($apps | Where-Object { $needed.Contains($_.Id) })
+
+          # Topological sort so in-repo dependencies compile before their consumers
+          $ordered = @()
+          $placed = [System.Collections.Generic.HashSet[string]]::new()
+          while ($ordered.Count -lt $neededApps.Count) {
+              $progressed = $false
+              foreach ($app in $neededApps) {
+                  if ($placed.Contains($app.Id)) { continue }
+                  $unplacedLocalDeps = @($app.Dependencies | Where-Object { $needed.Contains($_) -and -not $placed.Contains($_) })
+                  if ($unplacedLocalDeps.Count -eq 0) {
+                      $ordered += $app
+                      [void]$placed.Add($app.Id)
+                      $progressed = $true
+                  }
+              }
+              if (-not $progressed) { throw "Circular dependency between apps in this repository." }
+          }
+
+          $ordered | ConvertTo-Json -AsArray -Depth 4 | Set-Content (Join-Path $pwd '.apps-order.json')
+          Write-Host "Build order: $(($ordered | ForEach-Object Name) -join ' -> ')"
+
+      - name: Download BC artifact (compiler + Microsoft symbols)
+        env:
+          ghTokenWorkflowSecret: ${{ secrets.GHTOKENWORKFLOW }}
+          bcArtifactStorage: ${{ inputs.bcArtifactStorage }}
+          bcArtifactCache: ${{ inputs.bcArtifactCache }}
+        run: |
+          # Install and import BcContainerHelper for artifact resolution and download
+          # This handles authentication, version resolution, and artifact management
+          if (-not (Get-Module -ListAvailable -Name BcContainerHelper)) {
+              Write-Host "Installing BcContainerHelper..."
+              Install-Module BcContainerHelper -Force -Scope CurrentUser -SkipPublisherCheck
+          }
+          Import-Module BcContainerHelper -DisableNameChecking
+
+          # Initialize symbols folder
+          $symbolsFolder = Join-Path $pwd '.alpackages'
+          New-Item -ItemType Directory -Force -Path $symbolsFolder | Out-Null
+
+          # Read BC version from app.json
+          $appJsonFiles = Get-ChildItem -Path $pwd -Filter app.json -Recurse -Depth 2 |
+              Where-Object { $_.FullName -notmatch '[\/]\.' }
+
+          $applicationVersions = @()
+          foreach ($file in $appJsonFiles) {
+              $json = Get-Content $file.FullName -Raw | ConvertFrom-Json
+              if ($json.application) {
+                  $applicationVersions += $json.application
+              }
+          }
+
+          if ($applicationVersions.Count -eq 0) {
+              throw "Could not read BC application version from any app.json"
+          }
+
+          $bcVersion = ($applicationVersions | ForEach-Object { [version]$_ } | Sort-Object -Descending | Select-Object -First 1).ToString()
+          # Extract major.minor version (e.g., "28.3" from "28.3.0.0")
+          $majorMinorVersion = ($bcVersion -split '\.')[0..1] -join '.'
+
+          # Read AL-Go settings once - country differs per repo (e.g. "base" here, "fr" in the France repo)
+          $alGoSettings = Get-Content (Join-Path $pwd '.AL-Go/settings.json') -Raw | ConvertFrom-Json
+          $country = $alGoSettings.country
+          if (-not $country) { throw "country is not set in .AL-Go/settings.json" }
+
+          # Get the localization artifact matching this repo's country
+          $artifactUrl = Get-BCArtifactUrl -country $country -version $majorMinorVersion -select "latest"
+
+          # Create cache folder for downloaded artifacts
+          $cacheFolder = Join-Path $env:bcArtifactCache "bc-artifact-cache"
+          New-Item -ItemType Directory -Force -Path $cacheFolder | Out-Null
+
+          Download-Artifacts -artifactUrl $artifactUrl -basePath $cacheFolder
+
+          # Show directory structure
+          $topDirs = @(Get-ChildItem $cacheFolder -Directory -ErrorAction SilentlyContinue)
+          $topDirs | ForEach-Object {
+              $dirName = $_.Name
+              $appCount = @(Get-ChildItem $_.FullName -Filter "*.app" -Recurse -ErrorAction SilentlyContinue).Count
+              if ($appCount -gt 0) {
+                  Write-Host "  ${dirName}: ${appCount} app files"
+              }
+          }
+
+          # The apps to compile were already computed by the "Discover apps to
+          # translate" step (translatable app(s) plus their in-repo dependencies).
+          # Read that instead of a hand-maintained settings.json folder name - which
+          # drifts when this workflow is copied to another repo, and can't express a
+          # repo that publishes more than one app anyway.
+          $neededApps = Get-Content (Join-Path $pwd '.apps-order.json') -Raw | ConvertFrom-Json
+          $neededAppJsons = $neededApps | ForEach-Object { Get-Content (Join-Path $pwd $_.Folder 'app.json') -Raw | ConvertFrom-Json }
+
+          # All apps being compiled in this job share a single AL compiler run, so
+          # they must all target the same runtime.
+          $runtimes = @($neededAppJsons.runtime | Select-Object -Unique)
+          if ($runtimes.Count -eq 0) { throw "Could not determine runtime from any app.json" }
+          if ($runtimes.Count -gt 1) { throw "Apps being compiled declare different runtimes: $($runtimes -join ', ')" }
+          $runtime = $runtimes[0]
+
+          # Query NuGet for latest version of AL Development Tools matching runtime version
+          $nugetUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.dynamics.businesscentral.development.tools/index.json"
+          $versions = (Invoke-RestMethod -Uri $nugetUrl).versions |
+              Where-Object { $_ -like "$runtime*" } |
+              Sort-Object { [version]($_ -replace "-.*", "") } -Descending |
+              Select-Object -First 1
+
+          if (-not $versions) {
+              throw "No versions found for Microsoft.Dynamics.BusinessCentral.Development.Tools starting with $runtime"
+          }
+
+          $alVersion = $versions
+
+          # Download AL Development Tools from NuGet
+          $alToolsUrl = "https://www.nuget.org/api/v2/package/Microsoft.Dynamics.BusinessCentral.Development.Tools/$alVersion"
+          $alToolsZip = Join-Path $cacheFolder "al-tools.nupkg"
+          $alToolsExtract = Join-Path $cacheFolder "al-tools"
+
+          try {
+              Invoke-WebRequest -Uri $alToolsUrl -OutFile $alToolsZip -ErrorAction Stop
+
+              New-Item -ItemType Directory -Force -Path $alToolsExtract | Out-Null
+              Expand-Archive -Path $alToolsZip -DestinationPath $alToolsExtract -Force
+
+              # Find alc.exe in the extracted package
+              $alc = Get-ChildItem $alToolsExtract -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+              if (-not $alc) {
+                  throw "alc.exe not found in AL Development Tools package"
+              }
+          } catch {
+              Write-Host "Failed to download AL tools from NuGet, attempting fallback..."
+              $alc = Get-ChildItem $cacheFolder -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+              if (-not $alc) {
+                  throw "alc.exe not found in artifacts or NuGet download"
+              }
+          }
+
+          # Copy the whole extracted compiler package (alc.exe plus its dependent DLLs) into a
+          # workspace-relative folder so it can travel as a single actions/upload-artifact bundle
+          # to the Compile job, which runs on a different, possibly unrelated, self-hosted runner.
+          $alToolsFolder = Join-Path $pwd '.altools'
+          New-Item -ItemType Directory -Force -Path $alToolsFolder | Out-Null
+          Copy-Item (Join-Path $alc.DirectoryName '*') -Destination $alToolsFolder -Recurse -Force
+
+          # Collect all app files from cache
+          $allApps = @(Get-ChildItem $cacheFolder -Filter "*.app" -Recurse -ErrorAction SilentlyContinue)
+
+          # Copy only required Microsoft apps and their transitive dependencies.
+          # Read dependencies from every app being compiled - a repo can publish more
+          # than one app, and any of them may depend directly on a Microsoft app.
+          $appVersions = @($neededAppJsons.application | Where-Object { $_ })
+          if ($appVersions.Count -eq 0) { throw "Could not determine application version from any compiled app.json" }
+          $appMajorMinor = (($appVersions | ForEach-Object { [version]$_ } | Sort-Object -Descending | Select-Object -First 1).ToString() -split '\.')[0..1] -join '.'
+
+          Write-Host "Required Microsoft app version: $appMajorMinor"
+
+          # Microsoft dependencies declared in app.json (e.g. E-Document Core) need their
+          # symbols too, on top of the core platform apps every AL project needs.
+          $microsoftDependencyNames = @($neededAppJsons | ForEach-Object { $_.dependencies } |
+              Where-Object { $_.publisher -eq 'Microsoft' } |
+              ForEach-Object { $_.name } | Select-Object -Unique)
+
+          # List of required Microsoft apps to copy (using major.minor for flexible matching)
+          $requiredMicrosoftAppPatterns = @(
+              "Microsoft_Application_*$appMajorMinor*.app",
+              "Microsoft_Base Application_*$appMajorMinor*.app",
+              "Microsoft_Business Foundation_*$appMajorMinor*.app",
+              "Microsoft_System Application_*$appMajorMinor*.app"
+          ) + @($microsoftDependencyNames | ForEach-Object { "Microsoft_${_}_*$appMajorMinor*.app" })
+
+          $copiedApps = @{}
+          $copiedCount = 0
+
+          # Copy required Microsoft apps first using pattern matching
+          foreach ($pattern in $requiredMicrosoftAppPatterns) {
+              $foundApp = $allApps | Where-Object { $_.Name -like $pattern } | Select-Object -First 1
+              if ($foundApp) {
+                  Copy-Item $foundApp.FullName -Destination $symbolsFolder -Force
+                  $copiedApps[$foundApp.Name] = $foundApp.FullName
+                  $copiedCount++
+                  Write-Host "Copied: $($foundApp.Name)"
+              } else {
+                  Write-Host "Not found: $pattern"
+              }
+          }
+
+          # The base platform symbols package is named literally "System.app" - no
+          # "Microsoft_" prefix and no version suffix, unlike every other app above.
+          $systemApp = $allApps | Where-Object { $_.Name -eq 'System.app' } | Select-Object -First 1
+          if ($systemApp) {
+              Copy-Item $systemApp.FullName -Destination $symbolsFolder -Force
+              $copiedApps[$systemApp.Name] = $systemApp.FullName
+              $copiedCount++
+              Write-Host "Copied: $($systemApp.Name)"
+          } else {
+              Write-Host "Not found: System.app"
+          }
+
+          Write-Host "Copied $copiedCount Microsoft apps"
+
+          # XPR365 dependency apps are downloaded separately from GitHub repos (see below)
+
+          # Extract and check NavxManifest.xml in each copied app for transitive dependencies
+          $manifestAppsNeeded = @()
+          foreach ($copiedAppPath in $copiedApps.Values) {
+              try {
+                  $tempExtract = Join-Path $env:TEMP "manifest_$(Get-Random)"
+                  New-Item -ItemType Directory -Path $tempExtract | Out-Null
+
+                  # Extract app (it's a ZIP file)
+                  Expand-Archive -Path $copiedAppPath -DestinationPath $tempExtract -Force
+
+                  $manifest = Join-Path $tempExtract 'NavxManifest.xml'
+                  if (Test-Path $manifest) {
+                      [xml]$xml = Get-Content $manifest
+                      $dependencies = $xml.SelectNodes('//dependencies/dependency')
+                      foreach ($dep in $dependencies) {
+                          $depAppName = $dep.appName
+                          if ($depAppName -and -not $copiedApps.ContainsKey($depAppName)) {
+                              $manifestAppsNeeded += $depAppName
+                          }
+                      }
+                  }
+
+                  Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+              } catch {
+                  Write-Host "Warning: Could not read manifest from $copiedAppPath"
+              }
+          }
+
+          # Copy any transitive dependencies found in manifests
+          $transCount = 0
+          foreach ($appName in $manifestAppsNeeded) {
+              $foundApp = $allApps | Where-Object { $_.Name -eq $appName } | Select-Object -First 1
+              if ($foundApp -and -not $copiedApps.ContainsKey($foundApp.Name)) {
+                  Copy-Item $foundApp.FullName -Destination $symbolsFolder -Force
+                  $copiedApps[$foundApp.Name] = $foundApp.FullName
+                  $transCount++
+                  Write-Host "Copied transitive dependency: $($foundApp.Name)"
+              }
+          }
+
+          Write-Host "Total apps copied from BC artifacts: $copiedCount (all are Microsoft apps)"
+          Write-Host "XPR365 apps will be downloaded from GitHub repos below..."
+
+          # Verify Base Application and System app are present
+          $finalApps = @(Get-ChildItem $symbolsFolder -Filter "*.app" -ErrorAction SilentlyContinue)
+          $baseApp = $finalApps | Where-Object { $_.Name -like "*Base Application*" } | Select-Object -First 1
+          $systemApp = $finalApps | Where-Object { $_.Name -like "*System*" } | Select-Object -First 1
+
+          if (-not $baseApp) {
+              Write-Host "WARNING: Base Application not found!"
+          }
+          if (-not $systemApp) {
+              Write-Host "WARNING: System app not found!"
+          }
+          # GhTokenWorkflow is either a classic PAT or (as AL-Go supports) a GitHub App
+          # definition: {"GitHubAppClientId":"...","PrivateKey":"..."}. An app definition
+          # cannot be used as a bearer token directly - sign a short-lived JWT with the
+          # private key and exchange it for an installation access token, like AL-Go does.
+          function ConvertTo-Base64Url([byte[]]$bytes) {
+              [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+          }
+          $secret = $env:ghTokenWorkflowSecret
+          if (-not $secret) { throw "Secret GhTokenWorkflow is not configured" }
+          if ($secret.TrimStart().StartsWith('{')) {
+              $app = $secret | ConvertFrom-Json
+              $keyType = if ($app.PrivateKey -match 'BEGIN RSA PRIVATE KEY') { 'RSA PRIVATE KEY' } else { 'PRIVATE KEY' }
+              $keyBody = $app.PrivateKey -replace '-----(BEGIN|END)[^-]+-----', '' -replace '\s', ''
+              $pemLines = for ($i = 0; $i -lt $keyBody.Length; $i += 64) { $keyBody.Substring($i, [Math]::Min(64, $keyBody.Length - $i)) }
+              $pem = "-----BEGIN $keyType-----`n$($pemLines -join "`n")`n-----END $keyType-----"
+              $rsa = [System.Security.Cryptography.RSA]::Create()
+              $rsa.ImportFromPem($pem)
+              $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              $jwtHeader = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; typ = 'JWT' } | ConvertTo-Json -Compress)))
+              $jwtPayload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ iat = $now - 60; exp = $now + 540; iss = $app.GitHubAppClientId } | ConvertTo-Json -Compress)))
+              $signature = ConvertTo-Base64Url ($rsa.SignData(
+                  [Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"),
+                  [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                  [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
+              $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
+              # Assign before piping: Invoke-RestMethod emits a JSON array as one single
+              # array object, so piping it directly would filter the array as a whole.
+              $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
+              $allInstallations = $installations
+              $jwtHeaders_cached = $jwtHeaders
+          } else {
+              $token = $secret
+              $allInstallations = $null
+              $jwtHeaders_cached = $null
+          }
+          if ($token) {
+              Write-Host "::add-mask::$token"
+          }
+
+          # XPR365 dependency apps: resolve repos dynamically from AL-Go settings
+          $repoProbingPaths = @($alGoSettings.appDependencyProbingPaths | ForEach-Object {
+              @{ url = $_.repo; version = $_.version; releaseStatus = $_.release_status }
+          })
+
+          $depCount = 0
+          foreach ($repoPath in $repoProbingPaths) {
+              $repoUrl = $repoPath.url
+
+              # For GitHub App, get token for the specific organization
+              if ($allInstallations) {
+                  $orgName = ($repoUrl -split '/')[-2]
+                  $installation = $allInstallations | Where-Object { $_.account.login -eq $orgName } | Select-Object -First 1
+                  if (-not $installation) {
+                      Write-Host "GitHub App not installed on $orgName organization"
+                      continue
+                  }
+                  $token = (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders_cached).token
+              }
+
+              $apiHeaders = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json' }
+              $repo = $repoUrl -replace '^https://github.com/', ''
+              $apiUrl = $repoUrl -replace '^https://github\.com/', 'https://api.github.com/repos/'
+              $releaseStatus = $repoPath.releaseStatus
+              try {
+                  $allReleases = Invoke-RestMethod "$apiUrl/releases" -Headers $apiHeaders
+                  $release = $allReleases | Where-Object {
+                      if ($releaseStatus -eq 'prerelease') {
+                          $_.prerelease -eq $true
+                      } else {
+                          $_.prerelease -eq $false -and $_.draft -eq $false
+                      }
+                  } | Select-Object -First 1
+
+                  if (-not $release) {
+                      Write-Host "Warning: No $releaseStatus release found for $repo"
+                      continue
+                  }
+
+                  foreach ($asset in ($release.assets | Where-Object { $_.name -like '*-Apps-*.zip' })) {
+                      $zip = Join-Path $pwd $asset.name
+                      Invoke-WebRequest $asset.url -Headers @{ Authorization = "Bearer $token"; Accept = 'application/octet-stream' } -OutFile $zip
+                      $extract = Join-Path $pwd ".dep-$([IO.Path]::GetFileNameWithoutExtension($asset.name))"
+                      Expand-Archive $zip -DestinationPath $extract -Force
+                      Get-ChildItem $extract -Filter *.app -Recurse | ForEach-Object {
+                          Copy-Item $_.FullName -Destination $symbolsFolder -Force
+                          $depCount++
+                      }
+                      Remove-Item $zip, $extract -Recurse -Force
+                  }
+              } catch {
+                  Write-Host "Error fetching $repo : $($_.Exception.Message)"
+              }
+          }
+          Write-Host "Copied $depCount dependency app files"
+
+      - name: Upload build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: translate-build-inputs
+          path: |
+            .apps-order.json
+            .alpackages/**
+            .altools/**
+          if-no-files-found: error

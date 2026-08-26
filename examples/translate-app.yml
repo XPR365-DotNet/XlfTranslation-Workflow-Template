@@ -1,0 +1,54 @@
+name: 'Translate App'
+
+# Entry point of the translation pipeline: runs on every push, on every branch,
+# and commits fresh translation files back to that branch. It then dispatches
+# the AL-Go CI/CD workflow - which checks out the branch tip and therefore
+# builds WITH the just-committed translations - according to this rule:
+#   - push to main:            CI/CD is ALWAYS started, unconditionally.
+#   - push to any other branch: CI/CD is never started from here.
+#   - manual run:               CI/CD starts only if the startCicd input is checked.
+# CI/CD itself no longer triggers on push (CICDPushBranches is empty in
+# AL-Go-Settings.json), so main only builds once this workflow starts it.
+#
+# All the actual work (discover/download, compile, translate, commit) lives in the
+# reusable workflows in XPR365-DotNet/XlfTranslation-Workflow-Template - this file only
+# wires them together. See that repo's README for the artifact hand-off contract between
+# the four jobs below.
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/*.yaml'
+      - '!.github/workflows/CICD.yaml'
+
+  workflow_dispatch:
+    inputs:
+      startCicd:
+        description: 'Start the CI/CD workflow after translating'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  DownloadArtifacts:
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-download-artifacts.yml@main
+    secrets: inherit
+
+  Compile:
+    needs: DownloadArtifacts
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-compile.yml@main
+
+  Translate:
+    needs: Compile
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-translate.yml@main
+    secrets: inherit
+
+  PRManagement:
+    needs: Translate
+    uses: XPR365-DotNet/XlfTranslation-Workflow-Template/.github/workflows/translate-app-pr-management.yml@main
+    with:
+      startCicd: ${{ github.event_name == 'workflow_dispatch' && inputs.startCicd || false }}
+    secrets: inherit

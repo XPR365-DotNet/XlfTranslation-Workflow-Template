@@ -1,4 +1,5 @@
 name: Translate App - PR Management
+
 on:
   workflow_call:
     inputs:
@@ -7,17 +8,129 @@ on:
         default: false
     secrets:
       GHTOKENWORKFLOW:
-        required: false
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
 defaults:
   run:
     shell: pwsh
+
 jobs:
   PRManagement:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          token: ${{ secrets.GHTOKENWORKFLOW }}
-      - run: Write-Host "PR management"
-      - if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
-        run: Write-Host "Dispatch CI/CD"
+          # actions/checkout's credential-persistence cleanup runs
+          # `git config --local --unset includeif.gitdir:<path>.path <temp-creds-file>`,
+          # which fails with "invalid pattern" on self-hosted Windows runners because
+          # the temp file's backslash path is treated as a regex value-pattern. Push
+          # authenticates explicitly below instead, so persisted credentials aren't needed.
+          persist-credentials: false
+
+      - name: Download translation files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: TranslationFiles
+          path: ${{ github.workspace }}
+
+      - name: Commit and push translations
+        id: commit
+        env:
+          ghTokenWorkflowSecret: ${{ secrets.GHTOKENWORKFLOW }}
+        run: |
+          # Only actual translations are committed - *.g.xlf is generated at compile time
+          # and is not checked in.
+          $translatedFiles = Get-ChildItem -Path $pwd -Filter "*.xlf" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '[\\/]Translations[\\/]' -and -not $_.Name.EndsWith('.g.xlf') }
+
+          if (-not $translatedFiles) {
+              Write-Host "No translated files found"
+              Add-Content $env:GITHUB_OUTPUT "has_translations=false"
+              exit 0
+          }
+
+          Write-Host "Found $($translatedFiles.Count) translated files"
+          Add-Content $env:GITHUB_OUTPUT "has_translations=true"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          $translatedFiles | ForEach-Object { git add $_.FullName }
+
+          $status = git status --porcelain
+          if (-not $status) {
+              Write-Host "No changes to commit - translations already up to date"
+              exit 0
+          }
+
+          # GhTokenWorkflow is either a classic PAT or (as AL-Go supports) a GitHub App
+          # definition: {"GitHubAppClientId":"...","PrivateKey":"..."}. An app definition
+          # cannot be used as a bearer token directly - sign a short-lived JWT with the
+          # private key and exchange it for an installation access token, like AL-Go does.
+          $secret = $env:ghTokenWorkflowSecret
+          if (-not $secret) { throw "Secret GHTOKENWORKFLOW is not configured" }
+
+          $token = if ($secret.TrimStart().StartsWith('{')) {
+              $app = $secret | ConvertFrom-Json
+              $keyType = if ($app.PrivateKey -match 'BEGIN RSA PRIVATE KEY') { 'RSA PRIVATE KEY' } else { 'PRIVATE KEY' }
+              $keyBody = $app.PrivateKey -replace '-----(BEGIN|END)[^-]+-----', '' -replace '\s', ''
+              $pemLines = for ($i = 0; $i -lt $keyBody.Length; $i += 64) { $keyBody.Substring($i, [Math]::Min(64, $keyBody.Length - $i)) }
+              $pem = "-----BEGIN $keyType-----`n$($pemLines -join "`n")`n-----END $keyType-----"
+              $rsa = [System.Security.Cryptography.RSA]::Create()
+              $rsa.ImportFromPem($pem)
+
+              function ConvertTo-Base64Url([byte[]]$bytes) {
+                  [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+              }
+
+              $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              $jwtHeader = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; typ = 'JWT' } | ConvertTo-Json -Compress)))
+              $jwtPayload = ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes((@{ iat = $now - 60; exp = $now + 540; iss = $app.GitHubAppClientId } | ConvertTo-Json -Compress)))
+              $signature = ConvertTo-Base64Url ($rsa.SignData([Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
+              $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
+              $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
+              $installation = $installations | Where-Object { $_.account.login -eq 'XPR365-BC' } | Select-Object -First 1
+              if (-not $installation) { throw "GitHub App has no installation on XPR365-BC" }
+              (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders).token
+          } else {
+              $secret  # Classic PAT
+          }
+          Write-Host "::add-mask::$token"
+
+          git commit -m "Update translations [skip ci]"
+
+          # Direct commit to the branch that triggered this run - no separate branch, no PR.
+          git push "https://x-access-token:$token@github.com/$($env:GITHUB_REPOSITORY).git" "HEAD:${{ github.ref_name }}"
+          Write-Host "Pushed translation updates to ${{ github.ref_name }}"
+
+      - name: Start CI/CD
+        # Always for a push to main; for a manual run, only when requested.
+        # A push to any other branch never reaches this step.
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Dispatch AL-Go CI/CD on this branch. A workflow_dispatch run checks out the
+          # branch tip, so the build includes the translation commit pushed above.
+          # (workflow_dispatch is the documented exception to GITHUB_TOKEN's
+          # no-recursive-workflows rule.)
+          $headers = @{ Authorization = "Bearer $($env:GITHUB_TOKEN)"; Accept = 'application/vnd.github+json' }
+          $body = @{ ref = $env:GITHUB_REF_NAME } | ConvertTo-Json
+          Invoke-RestMethod -Method Post `
+              -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/actions/workflows/CICD.yaml/dispatches" `
+              -Headers $headers -Body $body
+          Write-Host "CI/CD dispatched on $($env:GITHUB_REF_NAME)."
+
+      - name: Skip CI/CD
+        if: "!((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))"
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') {
+              Write-Host "Push to $($env:GITHUB_REF_NAME) - CI/CD only auto-starts for main. Not starting it."
+          } else {
+              Write-Host "Manual run without 'Start the CI/CD workflow after translating' checked. Not starting CI/CD."
+          }

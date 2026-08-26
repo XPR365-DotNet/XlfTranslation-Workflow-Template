@@ -1,4 +1,5 @@
 name: Translate App - Translate
+
 on:
   workflow_call:
     inputs:
@@ -6,16 +7,108 @@ on:
         type: string
         default: https://xlftranslation-func-8370.azurewebsites.net
     secrets:
-      GHTOKENWORKFLOW:
-        required: false
+      XLF_TRANSLATION_FUNCTION_KEY:
+        required: true
+
 defaults:
   run:
     shell: pwsh
+
 jobs:
   Translate:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          token: ${{ secrets.GHTOKENWORKFLOW }}
-      - run: Write-Host "Translate via service"
+          persist-credentials: false
+
+      - name: Download generated translation files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: translate-generated-xlf
+          path: ${{ github.workspace }}
+
+      - name: Translate via XLF Translation Service
+        env:
+          functionKey: ${{ secrets.XLF_TRANSLATION_FUNCTION_KEY }}
+          translationServiceUrl: ${{ inputs.translationServiceUrl }}
+        run: |
+          if (-not $env:functionKey) { throw "Secret XLF_TRANSLATION_FUNCTION_KEY is not configured" }
+
+          # Preflight: the key must be valid for ALL endpoints, not only translate. A
+          # function-scoped TranslateXlf key passes the submit but gets 401 when polling.
+          # A valid host key returns 404 for an unknown job id - anything 401/403 means
+          # the secret holds the wrong kind of key.
+          try {
+              Invoke-RestMethod "$($env:translationServiceUrl)/api/status/preflight?code=$($env:functionKey)" | Out-Null
+          } catch {
+              $statusCode = [int]$_.Exception.Response.StatusCode
+              if ($statusCode -in 401, 403) {
+                  throw "XLF_TRANSLATION_FUNCTION_KEY is not valid for the status endpoint (HTTP $statusCode). It is probably a single-function key - store the function app's host (master) key in the secret instead."
+              }
+              if ($statusCode -ne 404) { throw }
+          }
+          Write-Host "Function key preflight OK"
+
+          # TranslationInfo.json is optional - create default if missing
+          $translationInfoPath = Join-Path $pwd '.AL-Go/TranslationInfo.json'
+          if (Test-Path $translationInfoPath) {
+              $config = Get-Content $translationInfoPath -Raw
+              Write-Host "Using TranslationInfo.json from: $translationInfoPath"
+          } else {
+              # Create minimal default config for translation service
+              $config = @{
+                  "languages" = @("sv-SE", "da-DK", "de-DE", "fr-FR")
+                  "transifexProjectName" = ""
+                  "includeTranslationsForAppSourceApps" = $false
+              } | ConvertTo-Json
+              Write-Host "TranslationInfo.json not found, using default config"
+          }
+          $apps = Get-Content (Join-Path $pwd '.apps-order.json') -Raw | ConvertFrom-Json
+
+          foreach ($app in ($apps | Where-Object Translate)) {
+              $translationsFolder = Join-Path $pwd $app.Folder 'Translations'
+              $gXlf = Get-ChildItem $translationsFolder -Filter *.g.xlf | Select-Object -First 1
+
+              Write-Host "Submitting $($gXlf.Name) for translation..."
+              $submit = Invoke-RestMethod -Method Post `
+                  -Uri "$($env:translationServiceUrl)/api/translate?code=$($env:functionKey)" `
+                  -Form @{ xlf = $gXlf; config = $config }
+              $jobId = $submit.jobId
+              Write-Host "Translation job queued: $jobId"
+
+              # A first run translates every language and can take a while; later runs are
+              # served from the service's translation memory and finish in seconds.
+              $deadline = (Get-Date).AddMinutes(45)
+              do {
+                  Start-Sleep -Seconds 2
+                  # ${jobId} - braces required: in pwsh '?' is legal in variable names, so
+                  # "$jobId?code=" would resolve the undefined variable 'jobId?code' instead.
+                  $status = Invoke-RestMethod "$($env:translationServiceUrl)/api/status/${jobId}?code=$($env:functionKey)"
+                  Write-Host "[$(Get-Date -Format HH:mm:ss)] $($status.Progress)% - $($status.Status) - $($status.Message)"
+              } while ($status.Status -notin 'completed', 'failed' -and (Get-Date) -lt $deadline)
+
+              if ($status.Status -ne 'completed') {
+                  throw "Translation job $jobId for '$($app.Name)' did not complete: $($status.Status) - $($status.Error)"
+              }
+
+              Write-Host "Downloading translations for '$($app.Name)'..."
+              $zipPath = Join-Path $pwd "translated-$jobId.zip"
+              Invoke-WebRequest "$($env:translationServiceUrl)/api/download/${jobId}?code=$($env:functionKey)" -OutFile $zipPath
+
+              # Place every translated xlf next to the source .g.xlf
+              $extractFolder = Join-Path $pwd ".translated-$jobId"
+              Expand-Archive $zipPath -DestinationPath $extractFolder -Force
+              Get-ChildItem $extractFolder -Filter *.xlf -Recurse | ForEach-Object {
+                  Copy-Item $_.FullName -Destination $translationsFolder -Force
+                  Write-Host "Added $($_.Name)"
+              }
+          }
+
+      - name: Upload translation files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: TranslationFiles
+          path: '**/Translations/*.xlf'
+          if-no-files-found: error

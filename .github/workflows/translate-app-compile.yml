@@ -1,17 +1,58 @@
 name: Translate App - Compile
+
 on:
-  workflow_call:
-    secrets:
-      GHTOKENWORKFLOW:
-        required: false
+  workflow_call: {}
+
 defaults:
   run:
     shell: pwsh
+
 jobs:
   Compile:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          token: ${{ secrets.GHTOKENWORKFLOW }}
-      - run: Write-Host "Compile apps"
+          persist-credentials: false
+
+      - name: Download build inputs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: translate-build-inputs
+          path: ${{ github.workspace }}
+
+      - name: Compile apps (generates translation files)
+        run: |
+          $apps = Get-Content (Join-Path $pwd '.apps-order.json') -Raw | ConvertFrom-Json
+          $symbolsFolder = Join-Path $pwd '.alpackages'
+          $outputFolder = Join-Path $pwd '.output'
+          New-Item -ItemType Directory -Force -Path $outputFolder | Out-Null
+
+          $alc = Get-ChildItem (Join-Path $pwd '.altools') -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          if (-not $alc) { throw "alc.exe not found in downloaded .altools build input" }
+
+          foreach ($app in $apps) {
+              $appFolder = Join-Path $pwd $app.Folder
+              Write-Host "Compiling '$($app.Name)'..."
+              $outApp = Join-Path $outputFolder "$($app.Publisher)_$($app.Name)_$($app.Version).app"
+              & $alc.FullName /project:"$appFolder" /packagecachepath:"$symbolsFolder" /out:"$outApp"
+              if ($LASTEXITCODE -ne 0) { throw "Compilation of '$($app.Name)' failed (exit code $LASTEXITCODE)" }
+              # Make this app available as a symbol for in-repo apps that depend on it
+              Copy-Item $outApp -Destination $symbolsFolder -Force
+              if ($app.Translate) {
+                  $gXlf = Get-ChildItem (Join-Path $appFolder 'Translations') -Filter *.g.xlf -ErrorAction SilentlyContinue
+                  if (-not $gXlf) { throw "Compilation of '$($app.Name)' did not produce a .g.xlf translation file" }
+                  Write-Host "Generated translation file: $($gXlf.Name)"
+              }
+          }
+
+      - name: Upload generated translation files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: translate-generated-xlf
+          path: |
+            .apps-order.json
+            **/Translations/*.g.xlf
+          if-no-files-found: error
