@@ -180,33 +180,45 @@ jobs:
 
           $alVersion = $versions
 
-          # Download AL Development Tools from NuGet
+          # Download AL Development Tools from NuGet, into a version-specific subfolder of
+          # the shared/persistent artifact cache. $cacheFolder lives on disk across every run
+          # and every repo that uses this self-hosted runner - a fixed, unversioned
+          # extraction path previously let a stale alc.exe from an earlier run (a different
+          # repo targeting a different runtime) linger and get silently picked up here
+          # instead of the version actually requested. Scoping the folder by $alVersion, and
+          # dropping the old "search the whole cache for any alc.exe" fallback, makes that
+          # impossible: either the exact version we asked for is used, or this throws.
           $alToolsUrl = "https://www.nuget.org/api/v2/package/Microsoft.Dynamics.BusinessCentral.Development.Tools/$alVersion"
-          $alToolsZip = Join-Path $cacheFolder "al-tools.nupkg"
-          $alToolsExtract = Join-Path $cacheFolder "al-tools"
+          $alToolsZip = Join-Path $cacheFolder "al-tools-$alVersion.nupkg"
+          $alToolsExtract = Join-Path $cacheFolder "al-tools-$alVersion"
 
-          try {
+          $alc = Get-ChildItem $alToolsExtract -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if ($alc) {
+              Write-Host "Reusing cached AL Development Tools $alVersion"
+          } else {
               Invoke-WebRequest -Uri $alToolsUrl -OutFile $alToolsZip -ErrorAction Stop
 
               New-Item -ItemType Directory -Force -Path $alToolsExtract | Out-Null
               Expand-Archive -Path $alToolsZip -DestinationPath $alToolsExtract -Force
 
-              # Find alc.exe in the extracted package
               $alc = Get-ChildItem $alToolsExtract -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
                   Select-Object -First 1
 
               if (-not $alc) {
-                  throw "alc.exe not found in AL Development Tools package"
-              }
-          } catch {
-              Write-Host "Failed to download AL tools from NuGet, attempting fallback..."
-              $alc = Get-ChildItem $cacheFolder -Filter alc.exe -Recurse -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-
-              if (-not $alc) {
-                  throw "alc.exe not found in artifacts or NuGet download"
+                  throw "alc.exe not found in the Microsoft.Dynamics.BusinessCentral.Development.Tools $alVersion package"
               }
           }
+
+          # Belt-and-braces: confirm the resolved compiler actually reports the runtime we
+          # asked for, rather than letting a mismatch surface later as a cryptic AL1043
+          # compile error in a different job.
+          $alcVersion = (Get-Item $alc.FullName).VersionInfo.FileVersion
+          if ($alcVersion -notlike "$runtime*") {
+              throw "Resolved alc.exe reports version '$alcVersion', which does not match the required runtime '$runtime' (expected an AL Development Tools package version starting with '$runtime')."
+          }
+          Write-Host "Using AL compiler $alcVersion for runtime $runtime"
 
           # Copy the whole extracted compiler package (alc.exe plus its dependent DLLs) into a
           # workspace-relative folder so it can travel as a single actions/upload-artifact bundle
