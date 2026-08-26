@@ -19,6 +19,7 @@ on:
     paths-ignore:
       - '**.md'
       - '.github/workflows/*.yaml'
+      - '.github/workflows/*.yml'
       - '!.github/workflows/CICD.yaml'
 
   workflow_dispatch:
