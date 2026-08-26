@@ -56,3 +56,6 @@ jobs:
             .apps-order.json
             **/Translations/*.g.xlf
           if-no-files-found: error
+          # .apps-order.json is dot-prefixed, and actions/upload-artifact excludes
+          # hidden files/folders by default.
+          include-hidden-files: true

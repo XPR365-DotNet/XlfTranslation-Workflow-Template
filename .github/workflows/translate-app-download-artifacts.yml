@@ -431,3 +431,6 @@ jobs:
             .alpackages/**
             .altools/**
           if-no-files-found: error
+          # .apps-order.json, .alpackages/, and .altools/ are all dot-prefixed, and
+          # actions/upload-artifact excludes hidden files/folders by default.
+          include-hidden-files: true
