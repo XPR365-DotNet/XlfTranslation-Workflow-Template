@@ -48,9 +48,9 @@ jobs:
 
           $hasTranslations = [bool]$translatedFiles
           # true only when this run had to fall back to a PR instead of a direct push (see
-          # below) - main won't actually contain the translations yet once this step ends,
-          # so "Start CI/CD" must not fire this run; it fires on the later push made by the
-          # PR's merge instead.
+          # below). Kept for visibility/telemetry only - it no longer gates "Start CI/CD",
+          # which always dispatches for a push to main regardless of how the translations
+          # got there.
           $usedFallbackPr = $false
 
           if (-not $hasTranslations) {
@@ -205,12 +205,11 @@ jobs:
           exit 0
 
       - name: Start CI/CD
-        # Always for a push to main; for a manual run, only when requested. Never when this
-        # run fell back to a PR - main doesn't have the translations yet, so dispatching now
-        # would build a stale tree; the PR's eventual merge triggers its own push-to-main run
-        # that dispatches CI/CD correctly once the translations have actually landed.
-        # A push to any other branch never reaches this step.
-        if: steps.commit.outputs.used_fallback_pr != 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))
+        # Always for a push to main - whether the translations landed via a direct push or
+        # via the fallback PR's squash-merge (both are pushes to main, and by the time this
+        # step runs the merge, if any, has already happened). For a manual run, only when
+        # requested. A push to any other branch never reaches this step.
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -226,11 +225,9 @@ jobs:
           Write-Host "CI/CD dispatched on $($env:GITHUB_REF_NAME)."
 
       - name: Skip CI/CD
-        if: "!(steps.commit.outputs.used_fallback_pr != 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true)))"
+        if: "!((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.startCicd == true))"
         run: |
-          if ('${{ steps.commit.outputs.used_fallback_pr }}' -eq 'true') {
-              Write-Host "Translations went through a fallback PR - not starting CI/CD now. It will start once the PR merges and re-triggers this pipeline on main."
-          } elseif ('${{ github.event_name }}' -eq 'push') {
+          if ('${{ github.event_name }}' -eq 'push') {
               Write-Host "Push to $($env:GITHUB_REF_NAME) - CI/CD only auto-starts for main. Not starting it."
           } else {
               Write-Host "Manual run without 'Start the CI/CD workflow after translating' checked. Not starting CI/CD."
