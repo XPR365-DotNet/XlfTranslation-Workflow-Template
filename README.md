@@ -4,7 +4,7 @@ This repository contains reusable GitHub Actions workflows for the Translate App
 
 ## Workflows
 
-- **translate-app-download-artifacts.yml**: Discovers apps to translate and downloads BC artifacts, the AL compiler, and dependency symbols
+- **translate-app-download-artifacts.yml**: Discovers translatable apps, optionally scoped by the consumer repository's `.AL-Go/settings.json` `appFolders`, then downloads BC artifacts, the AL compiler, and dependency symbols
 - **translate-app-compile.yml**: Compiles AL apps and generates `.g.xlf` translation files
 - **translate-app-translate.yml**: Translates XLF files via the translation service
 - **translate-app-pr-management.yml**: Commits translations directly to the triggering branch (falling back to a PR if the branch is protected) and manages CI/CD dispatch
@@ -56,6 +56,14 @@ jobs:
 Required secrets in the calling repository: `GHTOKENWORKFLOW` (PAT or GitHub App definition,
 used to download cross-org dependency apps and to push the translation commit) and
 `XLF_TRANSLATION_FUNCTION_KEY` (the translation service's host/master key).
+
+## App selection
+
+When `.AL-Go/settings.json` defines `appFolders`, the download workflow uses it as the
+translation scope. It translates only apps in those folders with the `TranslationFile` feature
+and also compiles any transitive in-repository dependencies needed as symbols. Apps outside
+`appFolders` are ignored unless they are such a dependency. When `appFolders` is not defined or
+empty, all apps with the `TranslationFile` feature are translated.
 
 If the target branch is protected, PR Management falls back to a scratch branch named
 `translate-app-<run number>` plus a PR, and deletes that branch itself once the PR has
