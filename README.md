@@ -24,6 +24,10 @@ to the next via `actions/upload-artifact` / `actions/download-artifact`:
 absolute path), since it is read back by jobs running on a different runner with a different
 checkout path. Don't hand-edit it.
 
+If `.AL-Go/settings.json` defines a non-empty `appFolders` array, only translatable apps in
+those folders are selected. Any in-repository dependencies of the selected apps are also
+compiled for symbols, even when they are outside the configured folders.
+
 ## Usage
 
 Add a workflow to your repository that calls these four jobs in sequence - see

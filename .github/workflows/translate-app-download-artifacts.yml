@@ -31,6 +31,13 @@ jobs:
           # Every folder with an app.json is an app; only apps whose 'features' array
           # contains 'TranslationFile' generate a .g.xlf at compile time and get translated.
           # Local dependencies of those apps are compiled too (for symbols), in dependency order.
+          $alGoSettings = Get-Content (Join-Path $pwd '.AL-Go/settings.json') -Raw | ConvertFrom-Json
+          $configuredAppFolders = @($alGoSettings.appFolders | ForEach-Object {
+              $folder = ($_ -replace '/', '\').Trim().TrimEnd('\')
+              if ($folder.StartsWith('.\')) { $folder = $folder.Substring(2) }
+              $folder
+          })
+
           $appJsonFiles = Get-ChildItem -Path $pwd -Filter app.json -Recurse -Depth 2 |
               Where-Object { $_.FullName -notmatch '[\\/]\.' }
 
@@ -52,7 +59,16 @@ jobs:
               }
           }
 
-          if (-not ($apps | Where-Object Translate)) {
+          $translationApps = @($apps | Where-Object Translate)
+          if ($configuredAppFolders.Count -gt 0) {
+              $translationApps = @($translationApps | Where-Object {
+                  $folder = ($_.Folder -replace '/', '\').TrimEnd('\')
+                  $configuredAppFolders -contains $folder
+              })
+              Write-Host "Configured appFolders: $($configuredAppFolders -join ', ')"
+          }
+
+          if ($translationApps.Count -eq 0) {
               throw "No app.json in this repository has the 'TranslationFile' feature - nothing to translate."
           }
 
@@ -67,7 +83,7 @@ jobs:
                   }
               }
           }
-          $apps | Where-Object Translate | ForEach-Object { Add-WithDependencies $_ }
+          $translationApps | ForEach-Object { Add-WithDependencies $_ }
           $neededApps = @($apps | Where-Object { $needed.Contains($_.Id) })
 
           # Topological sort so in-repo dependencies compile before their consumers
