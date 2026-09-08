@@ -178,18 +178,36 @@ jobs:
               return $null
           }
 
-          $countries = @($neededApps | ForEach-Object {
+          # Resolve each needed app's own project settings once - reused below both for
+          # country and for appDependencyProbingPaths (external, non-Microsoft dependency
+          # apps such as "XPR365 Async Tasks", hosted in another GitHub repo).
+          $neededAppSettings = @($neededApps | ForEach-Object {
               $folderSettings = Get-AlGoSettingsForFolder $_.Folder
-              if (-not $folderSettings -or -not $folderSettings.country) {
-                  throw "country is not set in .AL-Go/settings.json for the project containing $($_.Folder)"
+              if (-not $folderSettings) {
+                  throw "No .AL-Go/settings.json found for the project containing $($_.Folder)"
               }
-              $folderSettings.country
+              $folderSettings
+          })
+
+          $countries = @($neededAppSettings | ForEach-Object {
+              if (-not $_.country) {
+                  throw "country is not set in .AL-Go/settings.json for one of the projects being compiled"
+              }
+              $_.country
           } | Select-Object -Unique)
 
           if ($countries.Count -gt 1) {
               throw "Apps being compiled together belong to projects with different countries: $($countries -join ', '). A single build can only target one country."
           }
           $country = $countries[0]
+
+          # Union appDependencyProbingPaths across every project involved in this build (deduped
+          # by repo URL), so the XPR365 dependency app download further below works the same for
+          # single-project repos (one settings file) and multi-project repos (one per project).
+          $alGoSettings = [pscustomobject]@{
+              appDependencyProbingPaths = @($neededAppSettings.appDependencyProbingPaths | Where-Object { $_ } |
+                  Group-Object repo | ForEach-Object { $_.Group | Select-Object -First 1 })
+          }
 
           # Get the localization artifact matching this repo's country
           $artifactUrl = Get-BCArtifactUrl -country $country -version $majorMinorVersion -select "latest"
