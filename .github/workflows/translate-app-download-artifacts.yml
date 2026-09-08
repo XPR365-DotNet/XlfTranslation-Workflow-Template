@@ -30,8 +30,29 @@ jobs:
         run: |
           # appFolders defines the apps owned by this repository. Apps outside those folders
           # are considered only when they are local dependencies of a selected app.
-          $alGoSettings = Get-Content (Join-Path $pwd '.AL-Go/settings.json') -Raw | ConvertFrom-Json
-          $appFolders = @($alGoSettings.appFolders | ForEach-Object { $_.Trim().TrimEnd([char]'/', [char]'\').Replace('\', '/') })
+          #
+          # A single-project repo has one .AL-Go/settings.json at the repo root, with
+          # appFolders relative to the root. A multi-project repo instead has no root
+          # .AL-Go/settings.json at all - AL-Go moves .AL-Go into each project's own
+          # subfolder, and that project's appFolders are relative to its own folder, not the
+          # repo root. Gather every .AL-Go/settings.json found (root and/or project
+          # subfolders) so both layouts work the same way.
+          $alGoSettingsFiles = @(Get-ChildItem -Path $pwd -Filter settings.json -Recurse -Depth 2 |
+              Where-Object { $_.Directory.Name -eq '.AL-Go' })
+          if ($alGoSettingsFiles.Count -eq 0) {
+              throw "No .AL-Go/settings.json found at the repo root or in any project subfolder."
+          }
+
+          $appFolders = foreach ($settingsFile in $alGoSettingsFiles) {
+              $alGoSettings = Get-Content $settingsFile.FullName -Raw | ConvertFrom-Json
+              # Empty for a root .AL-Go (single-project); the project folder name for a
+              # project-level .AL-Go (multi-project).
+              $projectRoot = $settingsFile.Directory.Parent.FullName.Substring($pwd.Path.Length).Trim('\', '/').Replace('\', '/')
+              foreach ($folder in @($alGoSettings.appFolders)) {
+                  $folder = $folder.Trim().TrimEnd([char]'/', [char]'\').Replace('\', '/')
+                  if ($projectRoot) { "$projectRoot/$folder" } else { $folder }
+              }
+          }
 
           # Every configured folder with an app.json is an app; only apps whose 'features' array
           # contains 'TranslationFile' generate a .g.xlf at compile time and get translated.
@@ -136,10 +157,39 @@ jobs:
           # Extract major.minor version (e.g., "28.3" from "28.3.0.0")
           $majorMinorVersion = ($bcVersion -split '\.')[0..1] -join '.'
 
-          # Read AL-Go settings once - country differs per repo (e.g. "base" here, "fr" in the France repo)
-          $alGoSettings = Get-Content (Join-Path $pwd '.AL-Go/settings.json') -Raw | ConvertFrom-Json
-          $country = $alGoSettings.country
-          if (-not $country) { throw "country is not set in .AL-Go/settings.json" }
+          # Country differs per repo (e.g. "base" here, "fr" in the France repo) and, for a
+          # multi-project repo, potentially per project too. Resolve it per app by walking up
+          # from the app's folder to the nearest ancestor .AL-Go/settings.json (the project
+          # folder's own settings for a multi-project repo, or the repo root for a
+          # single-project repo) - the same layouts handled by the discovery step above.
+          function Get-AlGoSettingsForFolder([string]$relativeFolder) {
+              $current = $relativeFolder
+              while ($true) {
+                  # Join-Path rejects an empty Path argument, so the repo-root case (an empty
+                  # $current, once we've walked all the way up) needs its own branch.
+                  $settingsRelative = if ($current) { Join-Path $current '.AL-Go/settings.json' } else { '.AL-Go/settings.json' }
+                  $settingsPath = Join-Path $pwd $settingsRelative
+                  if (Test-Path $settingsPath) {
+                      return Get-Content $settingsPath -Raw | ConvertFrom-Json
+                  }
+                  if (-not $current) { break }
+                  $current = Split-Path $current -Parent
+              }
+              return $null
+          }
+
+          $countries = @($neededApps | ForEach-Object {
+              $folderSettings = Get-AlGoSettingsForFolder $_.Folder
+              if (-not $folderSettings -or -not $folderSettings.country) {
+                  throw "country is not set in .AL-Go/settings.json for the project containing $($_.Folder)"
+              }
+              $folderSettings.country
+          } | Select-Object -Unique)
+
+          if ($countries.Count -gt 1) {
+              throw "Apps being compiled together belong to projects with different countries: $($countries -join ', '). A single build can only target one country."
+          }
+          $country = $countries[0]
 
           # Get the localization artifact matching this repo's country
           $artifactUrl = Get-BCArtifactUrl -country $country -version $majorMinorVersion -select "latest"
