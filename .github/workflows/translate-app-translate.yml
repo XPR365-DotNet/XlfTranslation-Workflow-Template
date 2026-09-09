@@ -69,10 +69,14 @@ jobs:
           }
           Write-Host "Function key preflight OK"
 
-          # TranslationInfo.json is optional - create default if missing
-          $translationInfoPath = Join-Path $pwd '.AL-Go/TranslationInfo.json'
-          if (Test-Path $translationInfoPath) {
-              $config = Get-Content $translationInfoPath -Raw
+          # TranslationInfo.json is optional - create default if missing. Use the explicit
+          # GitHub workspace path rather than the PowerShell current-directory object so the
+          # check is stable across Windows runner shells.
+          $workspacePath = $env:GITHUB_WORKSPACE
+          $translationInfoPath = Join-Path -Path $workspacePath -ChildPath '.AL-Go\TranslationInfo.json'
+          Write-Host "Looking for TranslationInfo.json at: $translationInfoPath"
+          if (Test-Path -LiteralPath $translationInfoPath -PathType Leaf) {
+              $config = Get-Content -LiteralPath $translationInfoPath -Raw
               Write-Host "Using TranslationInfo.json from: $translationInfoPath"
           } else {
               # Create minimal default config for translation service
