@@ -69,8 +69,9 @@ jobs:
               $signature = ConvertTo-Base64Url ($rsa.SignData([Text.Encoding]::UTF8.GetBytes("$jwtHeader.$jwtPayload"), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1))
               $jwtHeaders = @{ Authorization = "Bearer $jwtHeader.$jwtPayload.$signature"; Accept = 'application/vnd.github+json' }
               $installations = Invoke-RestMethod 'https://api.github.com/app/installations' -Headers $jwtHeaders
-              $installation = $installations | Where-Object { $_.account.login -eq 'XPR365-BC' } | Select-Object -First 1
-              if (-not $installation) { throw "GitHub App has no installation on XPR365-BC" }
+              $owner = $env:GITHUB_REPOSITORY_OWNER
+              $installation = $installations | Where-Object { $_.account.login -eq $owner } | Select-Object -First 1
+              if (-not $installation) { throw "GitHub App has no installation on $owner" }
               (Invoke-RestMethod -Method Post -Uri $installation.access_tokens_url -Headers $jwtHeaders).token
           } else {
               $secret  # Classic PAT
