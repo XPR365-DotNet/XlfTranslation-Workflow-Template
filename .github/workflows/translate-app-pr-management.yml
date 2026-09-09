@@ -156,9 +156,21 @@ jobs:
                           --title "Update translations [skip ci]" --body "Automated translation update."
                       if ($LASTEXITCODE -ne 0) { throw "Failed to create a pull request for $prBranch -> $branch" }
 
-                      gh pr merge $prBranch --repo $env:GITHUB_REPOSITORY --squash --auto
+                      $autoMergeOutput = gh pr merge $prBranch --repo $env:GITHUB_REPOSITORY --squash --auto 2>&1 | Out-String
+                      Write-Host $autoMergeOutput
                       if ($LASTEXITCODE -ne 0) {
-                          Write-Host "Could not enable auto-merge on the translation PR - it may need a manual review/approval or repo auto-merge isn't enabled."
+                          if ($autoMergeOutput -match 'is in clean status') {
+                              # GitHub refuses to ENABLE auto-merge on a PR that is already
+                              # immediately mergeable ("clean" status) - there is nothing left
+                              # to wait for, so just merge it right away instead.
+                              Write-Host "PR is already mergeable - merging directly instead of enabling auto-merge."
+                              gh pr merge $prBranch --repo $env:GITHUB_REPOSITORY --squash
+                              if ($LASTEXITCODE -ne 0) {
+                                  Write-Host "Could not merge the translation PR - it may need a manual review/approval."
+                              }
+                          } else {
+                              Write-Host "Could not enable auto-merge on the translation PR - it may need a manual review/approval or repo auto-merge isn't enabled."
+                          }
                       }
 
                       # Only ever delete $prBranch once the PR has actually merged. `--auto`
