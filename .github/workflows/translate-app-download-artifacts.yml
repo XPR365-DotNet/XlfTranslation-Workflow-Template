@@ -48,7 +48,21 @@ jobs:
               # Empty for a root .AL-Go (single-project); the project folder name for a
               # project-level .AL-Go (multi-project).
               $projectRoot = $settingsFile.Directory.Parent.FullName.Substring($pwd.Path.Length).Trim('\', '/').Replace('\', '/')
-              foreach ($folder in @($alGoSettings.appFolders)) {
+              $configuredFolders = @($alGoSettings.appFolders | Where-Object { $_ -and $_.Trim() })
+              if ($configuredFolders.Count -eq 0) {
+                  # No appFolders setting: discover them the way AL-Go does - every folder in
+                  # this project that holds an app.json, except the configured test folders.
+                  $testFolders = @(@($alGoSettings.testFolders) + @($alGoSettings.bcptTestFolders) |
+                      Where-Object { $_ -and $_.Trim() } |
+                      ForEach-Object { $_.Trim().TrimEnd([char]'/', [char]'\').Replace('\', '/') })
+                  $projectDir = $settingsFile.Directory.Parent.FullName
+                  $configuredFolders = @(Get-ChildItem -Path $projectDir -Filter app.json -Recurse -Depth 2 |
+                      Where-Object { $_.FullName.Substring($projectDir.Length) -notmatch '[\\/]\.' } |
+                      ForEach-Object { $_.Directory.FullName.Substring($projectDir.Length).Trim('\', '/').Replace('\', '/') } |
+                      Where-Object { $_ -and $testFolders -notcontains $_ })
+                  Write-Host "No appFolders in $($settingsFile.FullName.Substring($pwd.Path.Length + 1)); discovered: $($configuredFolders -join ', ')"
+              }
+              foreach ($folder in $configuredFolders) {
                   $folder = $folder.Trim().TrimEnd([char]'/', [char]'\').Replace('\', '/')
                   if ($projectRoot) { "$projectRoot/$folder" } else { $folder }
               }

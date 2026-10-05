@@ -63,7 +63,9 @@ When `.AL-Go/settings.json` defines `appFolders`, the download workflow uses it 
 translation scope. It translates only apps in those folders with the `TranslationFile` feature
 and also compiles any transitive in-repository dependencies needed as symbols. Apps outside
 `appFolders` are ignored unless they are such a dependency. When `appFolders` is not defined or
-empty, all apps with the `TranslationFile` feature are translated.
+empty, the app folders are discovered the way AL-Go does: every folder in that project with an
+`app.json`, except those listed in `testFolders` or `bcptTestFolders`. Of those, the apps with the
+`TranslationFile` feature are translated.
 
 If the target branch is protected, PR Management falls back to a scratch branch named
 `translate-app-<run number>` plus a PR, and deletes that branch itself once the PR has
